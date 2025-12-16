@@ -57,7 +57,7 @@ def save_dataset_for_gnn(net, p_df, q_df, v_df, labels_df, folder="dataset"):
 # ==========================================
 def run_simulation_with_anomalies():
     # 1. 生成电网
-    net = create_custom_lv_grid(n_feeders=5, nodes_per_feeder=30)
+    net = create_custom_lv_grid(n_feeders=5)
 
     # 2. 提取干净数据
     n_steps = 96
