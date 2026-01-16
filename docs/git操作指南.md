@@ -1,0 +1,8 @@
+- git_init
+- git status
+- git add .
+- git commit -m "添加了git说明文档"
+- git push
+- git checkout -b hwj
+- git merge feature-login
+- git reset --soft HEAD^
