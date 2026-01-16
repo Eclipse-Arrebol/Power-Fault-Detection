@@ -10,3 +10,12 @@ results/
 
 # 忽略数据集文件夹 (可选：如果数据很大建议忽略，如果不大想保存备份就留着)
 # dataset/
+
+# 忽略虚拟环境文件夹
+v_env/
+venv/
+env/
+
+# 忽略 Python 编译文件
+__pycache__/
+*.pyc

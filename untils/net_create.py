@@ -1,94 +1,153 @@
 import pandapower as pp
-import numpy as np
-import random
+import pandapower.plotting as pplot
+import simbench as sb
+import matplotlib.pyplot as plt
+import pandas as pd
+import warnings
+
+# 忽略 pandas 的 FutureWarning
+warnings.simplefilter(action='ignore', category=FutureWarning)
 
 
-
-def create_custom_lv_grid(n_feeders=5, min_nodes=15, max_nodes=45):
+# ==========================================
+# 🏗️ 核心函数：克隆指定拓扑
+# ==========================================
+def create_cloned_simbench_grid(topo_code="1-LV-rural3--2-no_sw"):
     """
-        生成一个【高度拟真】的随机辐射状低压台区
-        :param n_feeders: 馈线数量 (主干线)
-        :param min_nodes: 每条线最少多少个用户
-        :param max_nodes: 每条线最多多少个用户
-        """
-    print(f">>> [Net] 正在构建随机异构电网 (Feeders={n_feeders}, Nodes={min_nodes}~{max_nodes})...")
+    完全克隆 SimBench 的拓扑结构（物理参数），但重建为纯净的 pandapower 网络。
+    并自动生成绘图坐标。
+    """
+    print(f">>> [Net] 正在克隆目标拓扑: {topo_code} ...")
 
-    # 1. 初始化空网络
+    # 1. 获取原始数据 (只为了读取参数)
+    try:
+        raw_net = sb.get_simbench_net(topo_code)
+    except Exception as e:
+        print(f"❌ 错误: 无法加载 SimBench 拓扑。请确保已安装 simbench 库。\n{e}")
+        return None
+
+    # 2. 初始化纯净网络
     net = pp.create_empty_network()
 
-    # 2. 创建源头：中压母线 (MV) 和 变压器 (Trafo)
-    # 坐标设为原点 (0,0)
-    mv_bus = pp.create_bus(net, vn_kv=20, name="MV Bus", geodata=(0, 0))
-    pp.create_ext_grid(net, bus=mv_bus, vm_pu=1.0)
+    # --- 映射表：旧 Bus ID -> 新 Bus ID ---
+    # 防止原始索引不连续导致错乱
+    old_to_new_bus = {}
 
-    lv_trafo_bus = pp.create_bus(net, vn_kv=0.4, name="LV Trafo Bus", geodata=(0, 0))
-    pp.create_transformer(net, hv_bus=mv_bus, lv_bus=lv_trafo_bus, std_type="0.4 MVA 20/0.4 kV")
+    # 3. 复制 Bus (节点)
+    # 注意：我们先暂时忽略原始坐标，最后统一生成，防止报错
+    for old_idx, row in raw_net.bus.iterrows():
+        new_idx = pp.create_bus(
+            net,
+            vn_kv=row['vn_kv'],
+            name=f"Bus_{old_idx}"
+        )
+        old_to_new_bus[old_idx] = new_idx
 
-    # 3. 随机生成各条馈线
-    load_count = 0
-    total_lines = 0
+    # 4. 复制 External Grid (外部电源)
+    for _, row in raw_net.ext_grid.iterrows():
+        pp.create_ext_grid(
+            net,
+            bus=old_to_new_bus[row['bus']],
+            vm_pu=1.02,
+            name="External Grid"
+        )
 
-    # 预先生成每条线的节点数，打破对称性
-    # 比如: [20, 42, 15, 33, 28]
-    nodes_per_feeder_list = [random.randint(min_nodes, max_nodes) for _ in range(n_feeders)]
+    # 5. 复制 Transformer (变压器)
+    for _, row in raw_net.trafo.iterrows():
+        pp.create_transformer_from_parameters(
+            net,
+            hv_bus=old_to_new_bus[row['hv_bus']],
+            lv_bus=old_to_new_bus[row['lv_bus']],
+            sn_mva=row['sn_mva'],
+            vn_hv_kv=row['vn_hv_kv'],
+            vn_lv_kv=row['vn_lv_kv'],
+            vkr_percent=row['vkr_percent'],
+            vk_percent=row['vk_percent'],
+            pfe_kw=row['pfe_kw'],
+            i0_percent=row['i0_percent'],
+            name=row['name']
+        )
 
-    for i, n_nodes in enumerate(nodes_per_feeder_list):
-        previous_bus = lv_trafo_bus
+    # 6. 复制 Line (线路) - 核心物理参数
+    for _, row in raw_net.line.iterrows():
+        pp.create_line_from_parameters(
+            net,
+            from_bus=old_to_new_bus[row['from_bus']],
+            to_bus=old_to_new_bus[row['to_bus']],
+            length_km=row['length_km'],
+            r_ohm_per_km=row['r_ohm_per_km'],
+            x_ohm_per_km=row['x_ohm_per_km'],
+            c_nf_per_km=row['c_nf_per_km'],
+            max_i_ka=row['max_i_ka'],
+            name=row['name']
+        )
 
-        # 设定这条线的“主攻方向” (基础角度)
-        base_angle = (2 * np.pi / n_feeders) * i
+    # 7. 重建 Load (负荷)
+    # 在原版有负荷的地方挂载空负荷
+    for _, row in raw_net.load.iterrows():
+        pp.create_load(
+            net,
+            bus=old_to_new_bus[row['bus']],
+            p_mw=0.0,  # 初始设为0
+            q_mvar=0.0,
+            name=f"Load_at_{row['bus']}"
+        )
 
-        # 记录当前的物理距离 (用于画图坐标推算)
-        current_x = 0.0
-        current_y = 0.0
+    print(f"    - 克隆完成！包含: {len(net.bus)} 节点, {len(net.line)} 线路, {len(net.load)} 负荷")
 
-        for j in range(n_nodes):
-            load_count += 1
-            total_lines += 1
-
-            # --- A. 随机物理参数 (核心) ---
-            # 线路长度随机化：0.03km 到 0.08km 之间 (30米~80米一根杆)
-            # 这直接决定了线路阻抗 R 和 X 的大小！
-            line_len = random.uniform(0.03, 0.08)
-
-            # --- B. 随机几何参数 (为了画图好看) ---
-            # 在主方向上加一点随机抖动 (-15度 到 +15度)
-            angle_jitter = random.uniform(-0.25, 0.25)
-            actual_angle = base_angle + angle_jitter
-
-            # 计算新坐标 (累加)
-            # 这里的 *20 只是为了画图时拉开距离，不影响物理计算
-            step_distance = line_len * 20
-            current_x += step_distance * np.cos(actual_angle)
-            current_y += step_distance * np.sin(actual_angle)
-
-            # --- C. 创建组件 ---
-            # 1. 创建节点
-            new_bus = pp.create_bus(net, vn_kv=0.4, name=f"F{i}_Node{j}", geodata=(current_x, current_y))
-
-            # 2. 创建线路
-            # 使用 create_line_from_parameters 保证参数完全受控
-            pp.create_line_from_parameters(
-                net,
-                from_bus=previous_bus,
-                to_bus=new_bus,
-                length_km=line_len,  # <--- 这里用了随机长度
-                r_ohm_per_km=0.206,  # 典型铝芯线电阻
-                x_ohm_per_km=0.080,  # 典型电抗
-                c_nf_per_km=261.0,
-                max_i_ka=0.270,
-                name=f"Line_F{i}_{j}"
-            )
-
-            # 3. 创建负载 (占位)
-            pp.create_load(net, bus=new_bus, p_mw=0.0, q_mvar=0.0, name=f"Load_{load_count}")
-
-            # 迭代指针
-            previous_bus = new_bus
-
-    print(f"    - 构建完成！")
-    print(f"    - 拓扑结构: {nodes_per_feeder_list}")
-    print(f"    - 总负载数: {len(net.load)}")
-    print(f"    - 总节点数: {len(net.bus)}")
+    # ==========================================
+    # 🔥 关键修复：自动生成绘图坐标
+    # ==========================================
+    # SimBench 自带的 geodata 经常损坏或缺失，导致 AttributeError。
+    # 这里我们使用 pandapower 的图算法自动计算拓扑坐标。
+    print("    - 正在自动计算拓扑布局坐标 (Generic Coordinates)...")
+    try:
+        pplot.create_generic_coordinates(net, overwrite=True)
+    except Exception as e:
+        print(f"    ⚠️ 警告: 坐标生成失败，画图可能会重叠。原因: {e}")
 
     return net
+
+
+# ==========================================
+# 🎨 绘图展示脚本
+# ==========================================
+def visualize_network():
+    # 1. 调用克隆函数
+    target_code = "1-LV-rural3--2-no_sw"
+    net = create_cloned_simbench_grid(target_code)
+
+    if net is None:
+        return
+
+    print("\n>>> 正在绘制拓扑图...")
+
+    # 创建图表对象
+    fig, ax = plt.subplots(figsize=(12, 8))
+
+    # 2. 绘图
+    # 因为我们用了 create_generic_coordinates，这里一定能画出来
+    pplot.simple_plot(
+        net,
+        plot_loads=True,  # 显示负载
+        plot_sgens=False,
+        show_plot=False,
+        ax=ax,
+        bus_size=0.7,  # 节点稍微画小一点，因为节点多
+        line_width=1.0
+    )
+
+    # 3. 添加装饰
+    plt.title(f"Cloned Topology: {target_code}", fontsize=15)
+    plt.xlabel("Generic X Coordinate", fontsize=12)
+    plt.ylabel("Generic Y Coordinate", fontsize=12)
+    plt.grid(True, linestyle='--', alpha=0.3)
+
+    # 4. 显示
+    plt.tight_layout()
+    plt.show()
+    print("✅ 绘图完成！此图展示了 SimBench 目标拓扑的物理结构。")
+
+
+if __name__ == "__main__":
+    visualize_network()

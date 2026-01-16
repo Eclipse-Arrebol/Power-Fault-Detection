@@ -11,7 +11,7 @@ import random
 import os  # 新增：用于创建文件夹
 
 
-from untils.net_create import create_custom_lv_grid
+from untils.net_create import create_cloned_simbench_grid
 from untils.get_data import extract_lv_simbench_data
 from untils.fate_inject import inject_anomalies
 
@@ -39,8 +39,24 @@ def save_dataset_for_gnn(net, p_df, q_df, v_df, labels_df, folder="dataset"):
     # 2. 保存图结构 (边列表 Edge List)
     # GNN 需要知道哪些节点是相连的
     # net.line 里的 from_bus 和 to_bus 就是图的边
-    edges = net.line[['from_bus', 'to_bus', 'length_km', 'r_ohm_per_km', 'x_ohm_per_km']]
+    edges = net.line[['from_bus', 'to_bus', 'length_km', 'r_ohm_per_km', 'x_ohm_per_km']].copy()
+    
+    # 计算实际电阻和电抗 (R = r_ohm_per_km * length_km, X = x_ohm_per_km * length_km)
+    edges['r_ohm'] = edges['r_ohm_per_km'] * edges['length_km']
+    edges['x_ohm'] = edges['x_ohm_per_km'] * edges['length_km']
+    
+    # 计算导纳 Y = 1 / Z = 1 / (R + jX)
+    # 导纳模值 |Y| = 1 / |Z| = 1 / sqrt(R^2 + X^2)
+    # 导纳实部 G = R / (R^2 + X^2)
+    # 导纳虚部 B = -X / (R^2 + X^2)
+    z_squared = edges['r_ohm']**2 + edges['x_ohm']**2
+    z_squared = z_squared.replace(0, 1e-10)  # 避免除零
+    edges['g_siemens'] = edges['r_ohm'] / z_squared  # 电导 (导纳实部)
+    edges['b_siemens'] = -edges['x_ohm'] / z_squared  # 电纳 (导纳虚部)
+    edges['y_magnitude'] = 1 / np.sqrt(z_squared)     # 导纳模值
+    
     edges.to_csv(f"{folder}/edges.csv", index=False)
+    print(f"    - 已计算并保存电阻(R)、电抗(X)和导纳(Y)到 edges.csv")
 
     # 3. 保存节点映射关系
     # 因为 P/Q/Label 是按 Load 排列的，但图结构是按 Bus 排列的
@@ -57,10 +73,10 @@ def save_dataset_for_gnn(net, p_df, q_df, v_df, labels_df, folder="dataset"):
 # ==========================================
 def run_simulation_with_anomalies():
     # 1. 生成电网
-    net = create_custom_lv_grid(n_feeders=5)
+    net = create_cloned_simbench_grid()
 
     # 2. 提取干净数据
-    n_steps = 96
+    n_steps = 6720
     clean_p, clean_q = extract_lv_simbench_data(len(net.load), n_steps)
     clean_p.columns = net.load.index
     clean_q.columns = net.load.index
