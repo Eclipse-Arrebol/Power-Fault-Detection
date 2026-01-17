@@ -20,7 +20,7 @@ from untils.fate_inject import inject_anomalies
 # ==========================================
 # 💾 新增：数据保存函数
 # ==========================================
-def save_dataset_for_gnn(net, p_df, q_df, v_df, labels_df, folder="dataset"):
+def save_dataset_for_gnn(net, p_df, q_df, v_df, labels_df, i_bus_df=None, folder="dataset"):
     """
     将所有训练所需的数据保存到 CSV 文件
     """
@@ -35,6 +35,58 @@ def save_dataset_for_gnn(net, p_df, q_df, v_df, labels_df, folder="dataset"):
     q_df.to_csv(f"{folder}/q_mvar.csv", index=False)
     v_df.to_csv(f"{folder}/vm_pu.csv", index=False)
     labels_df.to_csv(f"{folder}/labels.csv", index=False)
+    
+    # 🔥 新增：保存母线电流数据（如果有的话）
+    if i_bus_df is not None:
+        i_bus_df.to_csv(f"{folder}/i_bus_ka.csv", index=False)
+        print(f"    - 已保存母线电流数据到 i_bus_ka.csv (基于母线负荷聚合计算)")
+    
+    # 🔥 计算并保存负荷电流数据
+    # 对于每个负荷，根据其挂载的母线电压计算电流
+    # I = S / (√3 * V)
+    print("    - 正在计算负荷电流数据...")
+    
+    # 获取负荷到母线的映射
+    load_to_bus = dict(zip(net.load.index, net.load.bus))
+    
+    # 获取母线的基准电压 (kV)
+    bus_vn_kv = net.bus.vn_kv.to_dict()
+    
+    # 初始化电流矩阵（与P、Q相同维度）
+    i_load_df = pd.DataFrame(index=p_df.index, columns=p_df.columns, dtype=float)
+    
+    for load_idx in p_df.columns:
+        if load_idx in load_to_bus:
+            bus_idx = load_to_bus[load_idx]
+            
+            # 获取该母线的电压时间序列和基准电压
+            if bus_idx in v_df.columns and bus_idx in bus_vn_kv:
+                v_pu = v_df[bus_idx].values  # 母线电压 [p.u.]
+                v_base_kv = bus_vn_kv[bus_idx]  # 基准电压 [kV]
+                v_kv = v_pu * v_base_kv  # 实际电压 [kV]
+                
+                p_load = p_df[load_idx].values  # 有功功率 [MW]
+                q_load = q_df[load_idx].values  # 无功功率 [Mvar]
+                
+                # 计算视在功率 S = √(P² + Q²) [MVA]
+                s_load = np.sqrt(p_load**2 + q_load**2)
+                
+                # 计算电流 I = S / (√3 * V) [kA]
+                # 对于三相系统: I = S / (√3 * V_line)
+                # 避免除零
+                v_kv_safe = np.where(v_kv > 0.01, v_kv, 0.01)
+                i_load = s_load / (np.sqrt(3) * v_kv_safe)  # [kA]
+                
+                i_load_df[load_idx] = i_load
+            else:
+                # 如果找不到对应母线电压，设为0
+                i_load_df[load_idx] = 0.0
+        else:
+            i_load_df[load_idx] = 0.0
+    
+    # 保存负荷电流数据
+    i_load_df.to_csv(f"{folder}/i_load_ka.csv", index=False)
+    print(f"    - 已计算并保存负荷电流数据到 i_load_ka.csv (基于 I = S / (√3 * V))")
 
     # 2. 保存图结构 (边列表 Edge List)
     # GNN 需要知道哪些节点是相连的
@@ -99,6 +151,9 @@ def run_simulation_with_anomalies():
     ow = ts.OutputWriter(net, output_path=output_path, output_file_type=".json")
     # 记录所有节点的电压
     ow.log_variable('res_bus', 'vm_pu')
+    # 🔥 记录母线电流（从每个母线流出的总电流）
+    # 注意：pandapower的res_bus可能没有直接的电流字段，需要检查是否有p_mw和q_mvar
+    # 我们可以通过母线的功率和电压计算母线电流 I = S / (√3 * V)
 
     try:
         ts.run_timeseries(net, time_steps=range(n_steps), algorithm="nr")
@@ -107,11 +162,52 @@ def run_simulation_with_anomalies():
         # --- 提取仿真结果中的电压数据 ---
         # 结果在 ow.output['res_bus.vm_pu'] 中
         vm_results = ow.output['res_bus.vm_pu']
+        
+        # --- 计算母线电流数据 ---
+        # 方法：通过母线负荷聚合计算母线电流
+        print(">>> [6/7] 正在计算母线电流...")
+        
+        # 通过负荷-母线映射反向聚合计算母线电流
+        # 对于每个母线，汇总其上所有负荷的功率，然后计算电流
+        bus_vn_kv = net.bus.vn_kv.to_dict()
+        load_to_bus = dict(zip(net.load.index, net.load.bus))
+        
+        # 初始化母线电流矩阵 (时间步 x 母线数)
+        i_bus_df = pd.DataFrame(0.0, index=vm_results.index, columns=vm_results.columns, dtype=float)
+        
+        # 对每个母线，汇总其上的负荷功率
+        bus_p = pd.DataFrame(0.0, index=p_data.index, columns=vm_results.columns)
+        bus_q = pd.DataFrame(0.0, index=q_data.index, columns=vm_results.columns)
+        
+        for load_idx in net.load.index:
+            bus_idx = load_to_bus[load_idx]
+            if bus_idx in bus_p.columns:
+                bus_p[bus_idx] += p_data[load_idx]
+                bus_q[bus_idx] += q_data[load_idx]
+        
+        # 计算每个母线的电流 I = S / (√3 * V)
+        for bus_idx in vm_results.columns:
+            if bus_idx in bus_vn_kv:
+                v_pu = vm_results[bus_idx].values  # 母线电压 [p.u.]
+                v_base_kv = bus_vn_kv[bus_idx]  # 基准电压 [kV]
+                v_kv = v_pu * v_base_kv  # 实际电压 [kV]
+                
+                p_bus = bus_p[bus_idx].values  # 母线总有功 [MW]
+                q_bus = bus_q[bus_idx].values  # 母线总无功 [Mvar]
+                
+                # 计算视在功率 S = √(P² + Q²) [MVA]
+                s_bus = np.sqrt(p_bus**2 + q_bus**2)
+                
+                # 计算电流 I = S / (√3 * V) [kA]
+                v_kv_safe = np.where(v_kv > 0.01, v_kv, 0.01)
+                i_bus_df[bus_idx] = s_bus / (np.sqrt(3) * v_kv_safe)
+        
+        print(f"    - 已计算母线电流数据 (基于母线负荷聚合和公式 I = S / (√3 * V))")
 
-        # --- 6. 保存数据 (新增步骤) ---
-        save_dataset_for_gnn(net, p_data, q_data, vm_results, labels)
+        # --- 7. 保存数据 (新增步骤) ---
+        save_dataset_for_gnn(net, p_data, q_data, vm_results, labels, i_bus_df)
 
-        # --- 7. 画图 (仅做展示) ---
+        # --- 8. 画图 (仅做展示) ---
         anomalous_cols = labels.columns[labels.sum() > 0]
         if len(anomalous_cols) > 0:
             target_col = anomalous_cols[0]
