@@ -23,8 +23,8 @@ plt.rcParams['axes.unicode_minus'] = False
 # 配置: 选择模型类型
 # ============================================================
 USE_TEMPORAL = True  # True: 使用时序GNN (TGCN), False: 使用普通GCN
-USE_NGC = True        # True: 使用神经格兰杰因果模型 (优先级最高)
-USE_CAUSAL_LSTM = True  # True: 使用因果GCN-LSTM模型 (最高优先级)
+USE_NGC = False        # True: 使用神经格兰杰因果模型 (优先级最高)
+USE_CAUSAL_LSTM = False  # True: 使用因果GCN-LSTM模型 (最高优先级)
 SEQ_LEN = 12         # 时间窗口长度 (仅 TGCN 使用)
 BATCH_SIZE = 32      # 批大小
 SPARSITY_LAMBDA = 0.01  # 稀疏性正则化系数 (NGC 使用)
