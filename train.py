@@ -740,8 +740,8 @@ def train_gcn():
     # 3. 初始化模型
     print(f">>> [2/4] 初始化 GCN 模型 (Device: {device})...")
 
-    # 输入特征=3 (P,Q,V)，输出类别=4
-    model = GCN(num_features=6, num_classes=4).to(device)
+    # 输入特征=12 (P,Q,V,S,PF,I,V_dev,QP_ratio,ΔP,ΔQ,ΔV,ΔS)，输出类别=4
+    model = GCN(num_features=12, num_classes=4).to(device)
 
     # 【修改点 1】：学习率从 0.01 改为 0.005，因为加权后 Loss 会变大，步长小一点更稳
     optimizer = torch.optim.Adam(model.parameters(), lr=0.005, weight_decay=5e-4)
@@ -832,7 +832,7 @@ def train_gcn():
         'loss': avg_loss,
         'accuracy': acc,
         'class_weights': class_weights.cpu(),
-        'num_features': 6,
+        'num_features': 12,
         'num_classes': 4
     }
     torch.save(checkpoint, f"{save_dir}/checkpoint.pth")

@@ -15,6 +15,19 @@ from src.models import GCN, TGCN, NeuralGrangerCausality, CausalGCN_LSTM
 from evaluation.metrics import ModelEvaluator, calculate_class_statistics
 
 
+def _check_feature_compat(checkpoint, current_num_features, model_name):
+    checkpoint_num_features = checkpoint.get('num_features')
+    if checkpoint_num_features is None:
+        return True
+    if checkpoint_num_features != current_num_features:
+        print(
+            f"❌ {model_name} 特征维度不匹配: 现在={current_num_features}, "
+            f"模型检查点={checkpoint_num_features}. 请重新训练该模型。"
+        )
+        return False
+    return True
+
+
 def evaluate_gcn(dataset, evaluator, device):
     """
     评估 GCN 模型
@@ -35,7 +48,10 @@ def evaluate_gcn(dataset, evaluator, device):
     
     # 加载模型
     checkpoint = torch.load(model_path, map_location=device)
-    model = GCN(num_features=6, num_classes=4).to(device)
+    num_features = dataset.features.shape[2]
+    if not _check_feature_compat(checkpoint, num_features, "GCN"):
+        return None
+    model = GCN(num_features=num_features, num_classes=4).to(device)
     model.load_state_dict(checkpoint['model_state_dict'])
     model.eval()
     
@@ -103,6 +119,8 @@ def evaluate_tgcn(dataset, evaluator, device, seq_len=12, batch_size=64):
     
     # 加载模型
     checkpoint = torch.load(model_path, map_location=device)
+    if not _check_feature_compat(checkpoint, num_features, "TGCN"):
+        return None
     model = TGCN(num_features=num_features, num_classes=4, hidden_dim=64, num_layers=2).to(device)
     model.load_state_dict(checkpoint['model_state_dict'])
     model.eval()
@@ -180,6 +198,8 @@ def evaluate_ngc(dataset, evaluator, device, seq_len=12, batch_size=64):
     
     # 加载模型
     checkpoint = torch.load(model_path, map_location=device)
+    if not _check_feature_compat(checkpoint, num_features, "NGC"):
+        return None
     model = NeuralGrangerCausality(
         num_nodes=num_nodes,
         num_features=num_features,
@@ -264,6 +284,8 @@ def evaluate_causal_gcn_lstm(dataset, evaluator, device, seq_len=12, batch_size=
     
     # 加载模型
     checkpoint = torch.load(model_path, map_location=device)
+    if not _check_feature_compat(checkpoint, num_features, "CausalGCN_LSTM"):
+        return None
     edge_index_np = edge_index.numpy()
     
     model = CausalGCN_LSTM(
