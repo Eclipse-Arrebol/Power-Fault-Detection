@@ -864,3 +864,275 @@ def create_causal_model(num_nodes: int, num_features: int, num_classes: int,
         source_node=source_node,
         **kwargs
     )
+
+
+# ============================================================
+# 🔥 基线模型：CNN + LSTM
+# ============================================================
+class CNN_LSTM(nn.Module):
+    """
+    CNN+LSTM 基线模型
+    
+    架构：
+    - CNN: 提取节点局部时序特征（1D卷积在时间维度上）
+    - LSTM: 建模长期时序依赖
+    - 不考虑图结构，仅基于时序信息
+    """
+    def __init__(self, num_features, num_classes, hidden_dim=64, num_lstm_layers=2):
+        super(CNN_LSTM, self).__init__()
+        
+        self.hidden_dim = hidden_dim
+        
+        # 1D CNN 提取时序特征
+        self.conv1 = nn.Conv1d(num_features, hidden_dim, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm1d(hidden_dim)
+        self.conv2 = nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm1d(hidden_dim)
+        
+        # LSTM 时序建模
+        self.lstm = nn.LSTM(
+            input_size=hidden_dim,
+            hidden_size=hidden_dim,
+            num_layers=num_lstm_layers,
+            batch_first=True,
+            dropout=0.2 if num_lstm_layers > 1 else 0
+        )
+        
+        # 输出层
+        self.fc = nn.Linear(hidden_dim, num_classes)
+        self.dropout = nn.Dropout(0.3)
+        
+    def forward(self, x_seq, edge_index=None, edge_weight=None, node_mask=None):
+        """
+        Args:
+            x_seq: [batch, seq_len, num_nodes, features] 或 [seq_len, num_nodes, features]
+        Returns:
+            out: [batch, num_nodes, num_classes]
+        """
+        # 处理维度
+        if x_seq.dim() == 4:
+            batch_size, seq_len, num_nodes, num_features = x_seq.shape
+            # 重排为 [B*N, F, T] (CNN需要特征在中间维度)
+            x = x_seq.permute(0, 2, 3, 1).contiguous()  # [B, N, F, T]
+            x = x.view(batch_size * num_nodes, num_features, seq_len)
+        else:
+            seq_len, num_nodes, num_features = x_seq.shape
+            batch_size = 1
+            x = x_seq.permute(1, 2, 0).contiguous()  # [N, F, T]
+            x = x.view(num_nodes, num_features, seq_len)
+        
+        # CNN 提取特征
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = F.relu(x)
+        x = self.dropout(x)
+        
+        x = self.conv2(x)
+        x = self.bn2(x)
+        x = F.relu(x)
+        
+        # 转换为 [B*N, T, H] 给 LSTM
+        x = x.permute(0, 2, 1)  # [B*N, T, H]
+        
+        # LSTM
+        lstm_out, _ = self.lstm(x)
+        h_final = lstm_out[:, -1, :]  # 取最后时间步 [B*N, H]
+        
+        # 分类
+        out = self.fc(h_final)  # [B*N, C]
+        
+        # 还原维度
+        if batch_size > 1:
+            out = out.view(batch_size, num_nodes, -1)
+        else:
+            out = out.view(num_nodes, -1)
+        
+        return F.log_softmax(out, dim=-1)
+
+
+# ============================================================
+# 🔥 基线模型：CNN + GCN
+# ============================================================
+class CNN_GCN(nn.Module):
+    """
+    CNN+GCN 基线模型
+    
+    架构：
+    - CNN: 提取节点局部时序特征
+    - GCN: 在图上聚合空间信息
+    - 结合时序和空间特征
+    """
+    def __init__(self, num_features, num_classes, hidden_dim=64, num_gcn_layers=2):
+        super(CNN_GCN, self).__init__()
+        
+        self.hidden_dim = hidden_dim
+        
+        # 1D CNN 提取时序特征
+        self.conv1d_1 = nn.Conv1d(num_features, hidden_dim, kernel_size=3, padding=1)
+        self.bn1d_1 = nn.BatchNorm1d(hidden_dim)
+        self.conv1d_2 = nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=1)
+        self.bn1d_2 = nn.BatchNorm1d(hidden_dim)
+        
+        # GCN 聚合空间信息
+        self.gcn_layers = nn.ModuleList()
+        self.bn_layers = nn.ModuleList()
+        for _ in range(num_gcn_layers):
+            self.gcn_layers.append(GCNConv(hidden_dim, hidden_dim))
+            self.bn_layers.append(BatchNorm(hidden_dim))
+        
+        # 输出层
+        self.fc = nn.Linear(hidden_dim, num_classes)
+        self.dropout = nn.Dropout(0.3)
+        
+    def forward(self, x_seq, edge_index, edge_weight=None, node_mask=None):
+        """
+        Args:
+            x_seq: [batch, seq_len, num_nodes, features]
+        """
+        if x_seq.dim() == 4:
+            batch_size, seq_len, num_nodes, num_features = x_seq.shape
+            x = x_seq.permute(0, 2, 3, 1).contiguous()  # [B, N, F, T]
+            x = x.view(batch_size * num_nodes, num_features, seq_len)
+        else:
+            seq_len, num_nodes, num_features = x_seq.shape
+            batch_size = 1
+            x = x_seq.permute(1, 2, 0).contiguous()
+            x = x.view(num_nodes, num_features, seq_len)
+        
+        # CNN 时序特征提取
+        x = self.conv1d_1(x)
+        x = self.bn1d_1(x)
+        x = F.relu(x)
+        x = self.dropout(x)
+        
+        x = self.conv1d_2(x)
+        x = self.bn1d_2(x)
+        x = F.relu(x)
+        
+        # 全局平均池化 [B*N, H, T] -> [B*N, H]
+        x = torch.mean(x, dim=2)
+        
+        # GCN 空间聚合（需要逐batch处理）
+        if batch_size > 1:
+            x = x.view(batch_size, num_nodes, -1)  # [B, N, H]
+            outputs = []
+            for b in range(batch_size):
+                x_b = x[b]  # [N, H]
+                for gcn, bn in zip(self.gcn_layers, self.bn_layers):
+                    x_b = gcn(x_b, edge_index, edge_weight)
+                    x_b = bn(x_b)
+                    x_b = F.relu(x_b)
+                    x_b = self.dropout(x_b)
+                outputs.append(x_b)
+            x = torch.stack(outputs, dim=0)  # [B, N, H]
+        else:
+            for gcn, bn in zip(self.gcn_layers, self.bn_layers):
+                x = gcn(x, edge_index, edge_weight)
+                x = bn(x)
+                x = F.relu(x)
+                x = self.dropout(x)
+        
+        # 分类
+        out = self.fc(x)
+        return F.log_softmax(out, dim=-1)
+
+
+# ============================================================
+# 🔥 基线模型：CNN + GAT
+# ============================================================
+try:
+    from torch_geometric.nn import GATConv
+    
+    class CNN_GAT(nn.Module):
+        """
+        CNN+GAT 基线模型
+        
+        架构：
+        - CNN: 提取节点局部时序特征
+        - GAT: 图注意力网络，自适应学习节点间重要性
+        - 相比GCN，GAT能学习边的权重
+        """
+        def __init__(self, num_features, num_classes, hidden_dim=64, num_gat_layers=2, heads=4):
+            super(CNN_GAT, self).__init__()
+            
+            self.hidden_dim = hidden_dim
+            self.heads = heads
+            
+            # 1D CNN 提取时序特征
+            self.conv1d_1 = nn.Conv1d(num_features, hidden_dim, kernel_size=3, padding=1)
+            self.bn1d_1 = nn.BatchNorm1d(hidden_dim)
+            self.conv1d_2 = nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=1)
+            self.bn1d_2 = nn.BatchNorm1d(hidden_dim)
+            
+            # GAT 层（多头注意力）
+            self.gat_layers = nn.ModuleList()
+            self.bn_layers = nn.ModuleList()
+            
+            # 第一层 GAT
+            self.gat_layers.append(GATConv(hidden_dim, hidden_dim // heads, heads=heads, dropout=0.3))
+            self.bn_layers.append(BatchNorm(hidden_dim))
+            
+            # 后续 GAT 层
+            for _ in range(num_gat_layers - 1):
+                self.gat_layers.append(GATConv(hidden_dim, hidden_dim // heads, heads=heads, dropout=0.3))
+                self.bn_layers.append(BatchNorm(hidden_dim))
+            
+            # 输出层
+            self.fc = nn.Linear(hidden_dim, num_classes)
+            self.dropout = nn.Dropout(0.3)
+            
+        def forward(self, x_seq, edge_index, edge_weight=None, node_mask=None):
+            """
+            Args:
+                x_seq: [batch, seq_len, num_nodes, features]
+            """
+            if x_seq.dim() == 4:
+                batch_size, seq_len, num_nodes, num_features = x_seq.shape
+                x = x_seq.permute(0, 2, 3, 1).contiguous()  # [B, N, F, T]
+                x = x.view(batch_size * num_nodes, num_features, seq_len)
+            else:
+                seq_len, num_nodes, num_features = x_seq.shape
+                batch_size = 1
+                x = x_seq.permute(1, 2, 0).contiguous()
+                x = x.view(num_nodes, num_features, seq_len)
+            
+            # CNN 时序特征提取
+            x = self.conv1d_1(x)
+            x = self.bn1d_1(x)
+            x = F.relu(x)
+            x = self.dropout(x)
+            
+            x = self.conv1d_2(x)
+            x = self.bn1d_2(x)
+            x = F.relu(x)
+            
+            # 全局平均池化
+            x = torch.mean(x, dim=2)  # [B*N, H]
+            
+            # GAT 空间聚合
+            if batch_size > 1:
+                x = x.view(batch_size, num_nodes, -1)  # [B, N, H]
+                outputs = []
+                for b in range(batch_size):
+                    x_b = x[b]  # [N, H]
+                    for gat, bn in zip(self.gat_layers, self.bn_layers):
+                        x_b = gat(x_b, edge_index)  # GAT不使用edge_weight
+                        x_b = bn(x_b)
+                        x_b = F.relu(x_b)
+                        x_b = self.dropout(x_b)
+                    outputs.append(x_b)
+                x = torch.stack(outputs, dim=0)  # [B, N, H]
+            else:
+                for gat, bn in zip(self.gat_layers, self.bn_layers):
+                    x = gat(x, edge_index)
+                    x = bn(x)
+                    x = F.relu(x)
+                    x = self.dropout(x)
+            
+            # 分类
+            out = self.fc(x)
+            return F.log_softmax(out, dim=-1)
+            
+except ImportError:
+    print("Warning: GATConv not available, CNN_GAT model will not be available")
+    CNN_GAT = None

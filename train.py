@@ -8,7 +8,8 @@ import os
 
 # 导入我们在 src 里写的模块
 from src.dataset import PowerGridDataset
-from src.models import GCN, TGCN, TemporalGCN, NeuralGrangerCausality, CausalGCN_LSTM, create_causal_model
+from src.models import (GCN, TGCN, TemporalGCN, NeuralGrangerCausality, CausalGCN_LSTM, 
+                        create_causal_model, CNN_LSTM, CNN_GCN, CNN_GAT)
 from src.loss.causal_loss import CausalLoss, create_causal_loss
 
 # 导入画图函数
@@ -20,12 +21,21 @@ plt.rcParams['axes.unicode_minus'] = False
 
 
 # ============================================================
-# 配置: 选择模型类型
+# 配置: 选择模型类型 (同时只能选择一个为True)
 # ============================================================
-USE_TEMPORAL = True  # True: 使用时序GNN (TGCN), False: 使用普通GCN
-USE_NGC = False        # True: 使用神经格兰杰因果模型 (优先级最高)
-USE_CAUSAL_LSTM = False  # True: 使用因果GCN-LSTM模型 (最高优先级)
-SEQ_LEN = 12         # 时间窗口长度 (仅 TGCN 使用)
+# 主要模型
+USE_GCN = False          # True: 使用基础GCN模型
+USE_TEMPORAL = False     # True: 使用时序GNN (TGCN)
+USE_NGC = False          # True: 使用神经格兰杰因果模型
+USE_CAUSAL_LSTM = False  # True: 使用因果GCN-LSTM模型
+
+# 基线模型
+USE_CNN_LSTM = False     # True: 使用CNN+LSTM基线模型
+USE_CNN_GCN = False      # True: 使用CNN+GCN基线模型
+USE_CNN_GAT = True       # True: 使用CNN+GAT基线模型
+
+# 通用参数
+SEQ_LEN = 12         # 时间窗口长度
 BATCH_SIZE = 32      # 批大小
 SPARSITY_LAMBDA = 0.01  # 稀疏性正则化系数 (NGC 使用)
 
@@ -850,12 +860,399 @@ def train_gcn():
     plt.show()
 
 
+# ============================================================
+# 🔥 基线模型训练函数
+# ============================================================
+def train_cnn_lstm():
+    """训练 CNN+LSTM 基线模型"""
+    print("=" * 60)
+    print("🔥 训练 CNN+LSTM 基线模型")
+    print("=" * 60)
+    
+    # 1. 加载数据
+    print(">>> [1/4] 加载数据集...")
+    dataset = PowerGridDataset(dataset_path="dataset")
+    X, Y, edge_index, edge_weight, node_mask = dataset.get_temporal_tensors(seq_len=SEQ_LEN)
+    
+    num_samples, seq_len, num_nodes, num_features = X.shape
+    print(f">>> 数据形状: {X.shape}")
+    
+    # 2. 划分数据
+    indices = list(range(num_samples))
+    train_idx, test_idx = train_test_split(indices, test_size=0.2, shuffle=False)
+    X_train, Y_train = X[train_idx], Y[train_idx]
+    X_test, Y_test = X[test_idx], Y[test_idx]
+    
+    # 3. 初始化模型
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f">>> [2/4] 初始化模型 (Device: {device})...")
+    
+    model = CNN_LSTM(num_features=num_features, num_classes=4, hidden_dim=64, num_lstm_layers=2).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.002, weight_decay=5e-4)
+    class_weights = torch.tensor([2.0, 50.0, 50.0, 20.0]).to(device)
+    criterion = torch.nn.CrossEntropyLoss(weight=class_weights)
+    
+    # 4. 训练
+    print(">>> [3/4] 开始训练...")
+    loss_history = []
+    node_mask = node_mask.to(device)
+    
+    for epoch in range(100):
+        model.train()
+        total_loss = 0
+        perm = torch.randperm(len(train_idx))
+        
+        for i in range(0, len(train_idx), BATCH_SIZE):
+            batch_indices = perm[i:i + BATCH_SIZE]
+            x_batch = X_train[batch_indices].to(device)
+            y_batch = Y_train[batch_indices].to(device)
+            
+            optimizer.zero_grad()
+            out = model(x_batch)
+            
+            # 只计算有效节点的损失
+            out_flat = out.view(-1, 4)
+            y_flat = y_batch.view(-1)
+            mask_flat = node_mask.repeat(len(batch_indices))
+            
+            loss = criterion(out_flat[mask_flat], y_flat[mask_flat])
+            loss.backward()
+            optimizer.step()
+            
+            total_loss += loss.item()
+        
+        avg_loss = total_loss / (len(train_idx) // BATCH_SIZE + 1)
+        loss_history.append(avg_loss)
+        
+        if epoch % 10 == 0:
+            print(f"    Epoch {epoch:03d} | Loss: {avg_loss:.4f}")
+    
+    # 5. 评估
+    print(">>> [4/4] 评估模型...")
+    model.eval()
+    correct = 0
+    total = 0
+    
+    with torch.no_grad():
+        for i in range(0, len(test_idx), BATCH_SIZE * 2):
+            end_idx = min(i + BATCH_SIZE * 2, len(test_idx))
+            batch_indices = range(i, end_idx)
+            
+            x_batch = X_test[batch_indices].to(device)
+            y_batch = Y_test[batch_indices].to(device)
+            
+            out = model(x_batch)
+            pred = out.argmax(dim=-1)
+            
+            mask_expanded = node_mask.repeat(len(batch_indices))
+            pred_flat = pred.view(-1)
+            y_flat = y_batch.view(-1)
+            
+            correct += (pred_flat[mask_expanded] == y_flat[mask_expanded]).sum().item()
+            total += mask_expanded.sum().item()
+    
+    acc = correct / total
+    print(f"\n✅ 测试集准确率: {acc*100:.2f}%")
+    
+    # 6. 保存模型
+    save_dir = "result/cnn_lstm"
+    os.makedirs(save_dir, exist_ok=True)
+    torch.save(model.state_dict(), f"{save_dir}/model.pth")
+    checkpoint = {
+        'epoch': 100,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'loss': avg_loss,
+        'accuracy': acc,
+        'num_features': num_features,
+        'num_classes': 4
+    }
+    torch.save(checkpoint, f"{save_dir}/checkpoint.pth")
+    print(f"💾 模型已保存到: {save_dir}/")
+    
+    # 画图
+    plt.figure()
+    plt.plot(loss_history)
+    plt.title("CNN+LSTM Training Loss")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.grid(True)
+    plt.savefig(f"{save_dir}/training_loss.png", dpi=300)
+    plt.close()
+
+
+def train_cnn_gcn():
+    """训练 CNN+GCN 基线模型"""
+    print("=" * 60)
+    print("🔥 训练 CNN+GCN 基线模型")
+    print("=" * 60)
+    
+    # 1. 加载数据
+    print(">>> [1/4] 加载数据集...")
+    dataset = PowerGridDataset(dataset_path="dataset")
+    X, Y, edge_index, edge_weight, node_mask = dataset.get_temporal_tensors(seq_len=SEQ_LEN)
+    
+    num_samples, seq_len, num_nodes, num_features = X.shape
+    print(f">>> 数据形状: {X.shape}")
+    
+    # 2. 划分数据
+    indices = list(range(num_samples))
+    train_idx, test_idx = train_test_split(indices, test_size=0.2, shuffle=False)
+    X_train, Y_train = X[train_idx], Y[train_idx]
+    X_test, Y_test = X[test_idx], Y[test_idx]
+    
+    # 3. 初始化模型
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f">>> [2/4] 初始化模型 (Device: {device})...")
+    
+    model = CNN_GCN(num_features=num_features, num_classes=4, hidden_dim=64, num_gcn_layers=2).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.002, weight_decay=5e-4)
+    class_weights = torch.tensor([2.0, 50.0, 50.0, 20.0]).to(device)
+    criterion = torch.nn.CrossEntropyLoss(weight=class_weights)
+    
+    edge_index = edge_index.to(device)
+    edge_weight = edge_weight.to(device)
+    node_mask = node_mask.to(device)
+    
+    # 4. 训练
+    print(">>> [3/4] 开始训练...")
+    loss_history = []
+    
+    for epoch in range(100):
+        model.train()
+        total_loss = 0
+        perm = torch.randperm(len(train_idx))
+        
+        for i in range(0, len(train_idx), BATCH_SIZE):
+            batch_indices = perm[i:i + BATCH_SIZE]
+            x_batch = X_train[batch_indices].to(device)
+            y_batch = Y_train[batch_indices].to(device)
+            
+            optimizer.zero_grad()
+            out = model(x_batch, edge_index, edge_weight)
+            
+            out_flat = out.view(-1, 4)
+            y_flat = y_batch.view(-1)
+            mask_flat = node_mask.repeat(len(batch_indices))
+            
+            loss = criterion(out_flat[mask_flat], y_flat[mask_flat])
+            loss.backward()
+            optimizer.step()
+            
+            total_loss += loss.item()
+        
+        avg_loss = total_loss / (len(train_idx) // BATCH_SIZE + 1)
+        loss_history.append(avg_loss)
+        
+        if epoch % 10 == 0:
+            print(f"    Epoch {epoch:03d} | Loss: {avg_loss:.4f}")
+    
+    # 5. 评估
+    print(">>> [4/4] 评估模型...")
+    model.eval()
+    correct = 0
+    total = 0
+    
+    with torch.no_grad():
+        for i in range(0, len(test_idx), BATCH_SIZE * 2):
+            end_idx = min(i + BATCH_SIZE * 2, len(test_idx))
+            batch_indices = range(i, end_idx)
+            
+            x_batch = X_test[batch_indices].to(device)
+            y_batch = Y_test[batch_indices].to(device)
+            
+            out = model(x_batch, edge_index, edge_weight)
+            pred = out.argmax(dim=-1)
+            
+            mask_expanded = node_mask.repeat(len(batch_indices))
+            pred_flat = pred.view(-1)
+            y_flat = y_batch.view(-1)
+            
+            correct += (pred_flat[mask_expanded] == y_flat[mask_expanded]).sum().item()
+            total += mask_expanded.sum().item()
+    
+    acc = correct / total
+    print(f"\n✅ 测试集准确率: {acc*100:.2f}%")
+    
+    # 6. 保存模型
+    save_dir = "result/cnn_gcn"
+    os.makedirs(save_dir, exist_ok=True)
+    torch.save(model.state_dict(), f"{save_dir}/model.pth")
+    checkpoint = {
+        'epoch': 100,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'loss': avg_loss,
+        'accuracy': acc,
+        'num_features': num_features,
+        'num_classes': 4
+    }
+    torch.save(checkpoint, f"{save_dir}/checkpoint.pth")
+    print(f"💾 模型已保存到: {save_dir}/")
+    
+    plt.figure()
+    plt.plot(loss_history)
+    plt.title("CNN+GCN Training Loss")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.grid(True)
+    plt.savefig(f"{save_dir}/training_loss.png", dpi=300)
+    plt.close()
+
+
+def train_cnn_gat():
+    """训练 CNN+GAT 基线模型"""
+    print("=" * 60)
+    print("🔥 训练 CNN+GAT 基线模型")
+    print("=" * 60)
+    
+    if CNN_GAT is None:
+        print("❌ GAT 模型不可用，请检查 torch_geometric 是否安装了 GATConv")
+        return
+    
+    # 1. 加载数据
+    print(">>> [1/4] 加载数据集...")
+    dataset = PowerGridDataset(dataset_path="dataset")
+    X, Y, edge_index, edge_weight, node_mask = dataset.get_temporal_tensors(seq_len=SEQ_LEN)
+    
+    num_samples, seq_len, num_nodes, num_features = X.shape
+    print(f">>> 数据形状: {X.shape}")
+    
+    # 2. 划分数据
+    indices = list(range(num_samples))
+    train_idx, test_idx = train_test_split(indices, test_size=0.2, shuffle=False)
+    X_train, Y_train = X[train_idx], Y[train_idx]
+    X_test, Y_test = X[test_idx], Y[test_idx]
+    
+    # 3. 初始化模型
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f">>> [2/4] 初始化模型 (Device: {device})...")
+    
+    model = CNN_GAT(num_features=num_features, num_classes=4, hidden_dim=64, num_gat_layers=2, heads=4).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.002, weight_decay=5e-4)
+    class_weights = torch.tensor([2.0, 50.0, 50.0, 20.0]).to(device)
+    criterion = torch.nn.CrossEntropyLoss(weight=class_weights)
+    
+    edge_index = edge_index.to(device)
+    node_mask = node_mask.to(device)
+    
+    # 4. 训练
+    print(">>> [3/4] 开始训练...")
+    loss_history = []
+    
+    for epoch in range(100):
+        model.train()
+        total_loss = 0
+        perm = torch.randperm(len(train_idx))
+        
+        for i in range(0, len(train_idx), BATCH_SIZE):
+            batch_indices = perm[i:i + BATCH_SIZE]
+            x_batch = X_train[batch_indices].to(device)
+            y_batch = Y_train[batch_indices].to(device)
+            
+            optimizer.zero_grad()
+            out = model(x_batch, edge_index)
+            
+            out_flat = out.view(-1, 4)
+            y_flat = y_batch.view(-1)
+            mask_flat = node_mask.repeat(len(batch_indices))
+            
+            loss = criterion(out_flat[mask_flat], y_flat[mask_flat])
+            loss.backward()
+            optimizer.step()
+            
+            total_loss += loss.item()
+        
+        avg_loss = total_loss / (len(train_idx) // BATCH_SIZE + 1)
+        loss_history.append(avg_loss)
+        
+        if epoch % 10 == 0:
+            print(f"    Epoch {epoch:03d} | Loss: {avg_loss:.4f}")
+    
+    # 5. 评估
+    print(">>> [4/4] 评估模型...")
+    model.eval()
+    correct = 0
+    total = 0
+    
+    with torch.no_grad():
+        for i in range(0, len(test_idx), BATCH_SIZE * 2):
+            end_idx = min(i + BATCH_SIZE * 2, len(test_idx))
+            batch_indices = range(i, end_idx)
+            
+            x_batch = X_test[batch_indices].to(device)
+            y_batch = Y_test[batch_indices].to(device)
+            
+            out = model(x_batch, edge_index)
+            pred = out.argmax(dim=-1)
+            
+            mask_expanded = node_mask.repeat(len(batch_indices))
+            pred_flat = pred.view(-1)
+            y_flat = y_batch.view(-1)
+            
+            correct += (pred_flat[mask_expanded] == y_flat[mask_expanded]).sum().item()
+            total += mask_expanded.sum().item()
+    
+    acc = correct / total
+    print(f"\n✅ 测试集准确率: {acc*100:.2f}%")
+    
+    # 6. 保存模型
+    save_dir = "result/cnn_gat"
+    os.makedirs(save_dir, exist_ok=True)
+    torch.save(model.state_dict(), f"{save_dir}/model.pth")
+    checkpoint = {
+        'epoch': 100,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'loss': avg_loss,
+        'accuracy': acc,
+        'num_features': num_features,
+        'num_classes': 4
+    }
+    torch.save(checkpoint, f"{save_dir}/checkpoint.pth")
+    print(f"💾 模型已保存到: {save_dir}/")
+    
+    plt.figure()
+    plt.plot(loss_history)
+    plt.title("CNN+GAT Training Loss")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.grid(True)
+    plt.savefig(f"{save_dir}/training_loss.png", dpi=300)
+    plt.close()
+
+
 if __name__ == "__main__":
+    # 根据配置选择训练的模型
     if USE_CAUSAL_LSTM:
+        print("\n训练模型: CausalGCN_LSTM")
+        print("保存路径: result/causal_gcn_lstm/")
         train_causal_gcn_lstm()
     elif USE_NGC:
+        print("\n训练模型: NGC (Neural Granger Causality)")
+        print("保存路径: result/ngc/")
         train_ngc()
     elif USE_TEMPORAL:
+        print("\n训练模型: TGCN (Temporal GCN)")
+        print("保存路径: result/tgcn/")
         train_temporal()
-    else:
+    elif USE_CNN_LSTM:
+        print("\n训练模型: CNN+LSTM (Baseline)")
+        print("保存路径: result/cnn_lstm/")
+        train_cnn_lstm()
+    elif USE_CNN_GCN:
+        print("\n训练模型: CNN+GCN (Baseline)")
+        print("保存路径: result/cnn_gcn/")
+        train_cnn_gcn()
+    elif USE_CNN_GAT:
+        print("\n训练模型: CNN+GAT (Baseline)")
+        print("保存路径: result/cnn_gat/")
+        train_cnn_gat()
+    elif USE_GCN:
+        print("\n训练模型: GCN (Graph Convolutional Network)")
+        print("保存路径: result/gcn/")
         train_gcn()
+    else:
+        print("❌ 错误: 请在配置区域设置一个模型为 True")
+        print("可选模型: USE_GCN, USE_TEMPORAL, USE_NGC, USE_CAUSAL_LSTM,")
+        print("         USE_CNN_LSTM, USE_CNN_GCN, USE_CNN_GAT")
