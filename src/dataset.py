@@ -82,19 +82,67 @@ class PowerGridDataset:
                 base_features[:, bus_idx, 1] = self.q_df.iloc[:, load_idx].values
                 self.labels[:, bus_idx] = self.labels_df.iloc[:, load_idx].values
 
-        # --- 🔥🔥 【核心修改】计算差分特征 (Delta) 🔥🔥 ---
-        # 现在的特征形状将变成 [Time, Buses, 6]
-        # 新增的特征: [Delta_P, Delta_Q, Delta_V]
+        # --- 🔥🔥 【核心修改】丰富的特征工程 🔥🔥 ---
+        # 原始特征: P, Q, V (3维)
+        # 新增特征:
+        #   - S: 视在功率 = sqrt(P^2 + Q^2)
+        #   - PF: 功率因数 = P / S (cos φ)
+        #   - I: 电流估算 = S / V (标幺值下的近似)
+        #   - Delta_P, Delta_Q, Delta_V: 时序差分
+        #   - V_dev: 电压偏差 = |V - 1.0| (偏离标准电压的程度)
+        #   - Q/P ratio: 无功有功比 (反映负荷特性)
+        
+        P = base_features[:, :, 0]  # [Time, Buses]
+        Q = base_features[:, :, 1]
+        V = base_features[:, :, 2]
+        
+        # 1. 视在功率 S = sqrt(P^2 + Q^2)
+        S = np.sqrt(P**2 + Q**2)
+        
+        # 2. 功率因数 PF = P / S (避免除零)
+        S_safe = np.where(S > 1e-6, S, 1e-6)
+        PF = P / S_safe
+        PF = np.clip(PF, -1.0, 1.0)  # 功率因数范围 [-1, 1]
+        
+        # 3. 电流估算 I = S / V (标幺值近似)
+        V_safe = np.where(V > 0.01, V, 0.01)
+        I_est = S / V_safe
+        
+        # 4. 电压偏差 V_dev = |V - 1.0|
+        V_dev = np.abs(V - 1.0)
+        
+        # 5. 无功有功比 Q/P ratio (反映负荷特性，感性/容性)
+        P_safe = np.where(np.abs(P) > 1e-6, P, 1e-6)
+        QP_ratio = Q / P_safe
+        QP_ratio = np.clip(QP_ratio, -10.0, 10.0)  # 限制范围避免极端值
+        
+        # 6. 时序差分 Delta
+        delta_P = np.diff(P, axis=0, prepend=P[0:1, :])
+        delta_Q = np.diff(Q, axis=0, prepend=Q[0:1, :])
+        delta_V = np.diff(V, axis=0, prepend=V[0:1, :])
+        
+        # 7. 视在功率变化率
+        delta_S = np.diff(S, axis=0, prepend=S[0:1, :])
+        
+        # === 组合所有特征 ===
+        # 最终特征: [P, Q, V, S, PF, I_est, V_dev, QP_ratio, ΔP, ΔQ, ΔV, ΔS]
+        # 共 12 维特征
+        self.features = np.stack([
+            P, Q, V,           # 原始特征 (3)
+            S, PF, I_est,      # 派生物理量 (3)
+            V_dev, QP_ratio,   # 状态指标 (2)
+            delta_P, delta_Q, delta_V, delta_S  # 时序差分 (4)
+        ], axis=2)
+        
+        self.feature_names = [
+            'P (有功功率)', 'Q (无功功率)', 'V (电压)',
+            'S (视在功率)', 'PF (功率因数)', 'I (电流估算)',
+            'V_dev (电压偏差)', 'Q/P (无功有功比)',
+            'ΔP', 'ΔQ', 'ΔV', 'ΔS'
+        ]
 
-        # 1. 计算差分 (当前时刻 - 上一时刻)
-        # axis=0 表示沿时间轴计算
-        delta_features = np.diff(base_features, axis=0, prepend=base_features[0:1, :, :])
-
-        # 2. 拼接到一起
-        # 最终 shape: (Time, Buses, 6)
-        self.features = np.concatenate([base_features, delta_features], axis=2)
-
-        print(f">>> 特征工程完成！输入特征维度从 3 提升至 {self.features.shape[2]} (增加了时序差分)")
+        print(f">>> 特征工程完成！输入特征维度: {self.features.shape[2]}")
+        print(f"    特征列表: {', '.join(self.feature_names)}")
 
         # 4. 归一化 (维度变了，Scaler也要自适应)
         scaler = StandardScaler()
